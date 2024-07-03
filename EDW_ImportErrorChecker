@@ -1,0 +1,512 @@
+function main(workbook: ExcelScript.Workbook) {
+/** Script attempts to identify many of the common EDW import errors associated with Crops Schedules and find issues with Data entry. */
+
+//////This could be improved by iterating through each sheet versus lifting them all into memory at once.
+
+  /** Returns a dictionary with tab names as keys and values as row data array. All fully blank rows are removed. */
+  function grabDataFromEveryTab() {
+
+    let allTabs = workbook.getWorksheets();
+    let tabNames = allTabs.map(element => { return element.getName() });
+    // tab name must contain a ^
+    let caratTabNames = tabNames.filter(element => { return element.match(/\^/) });
+
+    var allData = {};
+
+    let allCSData = caratTabNames.forEach(tabName => {
+      let df: [[]] = workbook.getWorksheet(tabName).getUsedRange(true).getValues();
+
+      // Filter for rows where only some of the datapoints are blank but not all; i.e. empty rows with formatting will be removed.
+      allData[tabName] = df.filter((element) => element.some((datapoint: string | Date | number) => {
+
+        let answer = datapoint !== "";
+        return answer
+      }));
+    });
+
+    return allData
+  }
+
+
+  /** Function returns a setting strategy for the the error dictionary */
+  function errorHandleDictPushing(errorId: string, col: string, row: number | string, currentErrors: {}, tabName: string) {
+
+    // TypeError if the dictionary key doesn't already exist.
+    try {
+
+      return currentErrors[tabName].push([errorId, col, row]);
+    } catch (TypeError) {
+
+      // TypeError if the dictionary key has not already been assigned an array.
+      try {
+        currentErrors[tabName].length;
+      } catch (TypeError) {
+        currentErrors[tabName] = [];
+      }
+
+      return currentErrors[tabName].push([errorId, col, row]);
+    }
+  }
+
+
+  function dataTypeChecker(value: string|number) {}
+
+
+  /** The file name is evaluated against currently used names */
+  function validateFileNameFormat(errorRowData: {}) {
+
+    let errorsDictToReturn = errorRowData;
+    let workbookName = workbook.getName();
+    let fileNameErrorKey = "Workbook Name";
+    let locations = ["ATL1", "BAL", "CHI1", "G7", "DAL1", "DAV", "DEN1 G8", "DEN2", "NYC1", "NYC2", "NYC3", "PVD", "VGA"];
+    let locationMatch = "";
+    let acceptedScheduleEnding = "Crop Schedule"
+    let acceptedFileType = ".xlsx";
+
+    let fileTypeRegex = new RegExp(/\.xlsx/,'g');
+    // Test to see the file type.
+    if (!workbookName.match(fileTypeRegex)) { 
+    
+      errorHandleDictPushing("File Naming Error", "File Type not .xlsx", "Workbook", errorsDictToReturn, fileNameErrorKey);
+    }
+
+    for (let location of locations) {
+      
+      let locRegex = new RegExp(`${location}`,'g');
+      
+      if (workbookName.match(locRegex)) {
+        locationMatch=location
+        break;  
+      }
+    }
+
+    // Test to see that the location naming has not changed.
+    if (locationMatch === "") {
+
+      errorHandleDictPushing("File Naming Error", "Location Name not Typical", "Workbook", errorsDictToReturn, fileNameErrorKey);
+    }
+
+
+    let fullFileName = locationMatch + " " + acceptedScheduleEnding + ".xlsx"
+   
+    if (workbookName!==fullFileName) {
+      
+      errorHandleDictPushing("File Naming Error", "Workbook name, not accepted Std.", "Workbook", errorsDictToReturn, fileNameErrorKey);
+    }
+
+    return errorsDictToReturn
+  }
+
+
+  function validateTabNames(tabName: string, errorRowData: {}) {
+
+    let errorsDictToReturn = errorRowData;
+    let caratRegexTabTest = tabName.match(/^\^/);
+    let endingSpaceRegexTabTest = tabName.match(/\s$/);
+
+    if (caratRegexTabTest && !endingSpaceRegexTabTest) {
+      //Test succeeded. The tab name 1st character is a carat.
+
+    } else {
+
+      errorHandleDictPushing("Tab Naming Error", "Tab", "Worksheet Tab", errorsDictToReturn, tabName);
+    }
+
+
+    return errorRowData
+  }
+
+
+  /** Function chooses the correct key of column name values by site filename. It then compares the gutters that are hard coded as required against the columns that are already present.*/
+  function validateColumnNames(tabName: string, lineData: [[]], errorRowData: {}, siteName: string) {
+
+    const criticalColumnsDict = {
+      "A": ["Assembly", "Line", "Crop", "Seed Variety", "Seed Date", "Nursery Transplant", "Finishing Transplant", "Harvest Date", "Notes", "Group Size (Trays)", "Group Size (Gutters)", "Finishing Valve", "Finishing Line", "PS Sown", "PS Planted"],
+      "B": ["Assembly", "Line", "Crop", "Seed Variety", "Seed Date", "Harvest Date", "Notes", "Group Size (Trays)", "Group Size (Gutters)", "PS Sown", "PS Planted"]
+    };
+
+    const sitesUsingVersionA = ["DEN1", "NYC1", "NYC2"].includes(siteName) ? "A" : "B";
+
+    let errorsDictToReturn = errorRowData;
+    let headerRow: [] = lineData[0];
+
+    let firstRowOfTab: (string)[] = workbook.getWorksheet(tabName).getRangeByIndexes(0, 0, 1, headerRow.length).getValues()[0];
+
+    for (let firstRowColumns of headerRow) {
+
+      if (!firstRowOfTab.includes(firstRowColumns)) { 
+
+        errorHandleDictPushing("Header Row Error", `Header: ${firstRowColumns}`, "Ensure Row 1 is Header Row", errorsDictToReturn, tabName);
+      }
+    }
+
+
+    // double check all of the spelling.
+    for (let requiredColName of criticalColumnsDict[sitesUsingVersionA]) {
+
+      if (headerRow.includes(requiredColName)) {
+
+        continue;
+      } else {
+
+        errorHandleDictPushing("Column Name Error", requiredColName, "Incorrect or Missing Col.Name", errorsDictToReturn, tabName);
+      }
+    }
+
+    return errorsDictToReturn
+  }
+
+
+  /** Validate sku entries against a master list. */
+  function validateForSKU(tabName: string, lineData: [[]], errorRowData: {}, acceptedSkus: []) {
+
+    let errorsDictToReturn = errorRowData;
+    let tabHeader: [] = lineData[0];
+    let skuColIndex: number = tabHeader.indexOf("Crop");
+    let tabRowLength: number = lineData.length;
+
+    var errantDataArr = lineData.map((element) => element[skuColIndex] !== "" && acceptedSkus.includes(element[skuColIndex]));
+
+    for (let row = 1; row < tabRowLength; row++) {
+
+      if (errantDataArr[row] === false) {
+
+        errorHandleDictPushing("SKU Code Error", "Crop", Number(row) + 1, errorsDictToReturn, tabName);
+      }
+
+    }
+
+    return errorsDictToReturn
+  }
+
+
+  /** Function returns the error dictionary with newly set errors related to incorrect MO entry. */
+  function validateForAssembly(tabName: string, lineData: [[]], errorRowData: {}) {
+
+    // Matches only strings with MO followed by 8 digits, or fully empty values.
+    const moRegex = /(^$)|(^MO\d{8})|(^ASS\d{7})/g;
+
+    let errorsDictToReturn = errorRowData;
+    let tabHeader: [] = lineData[0];
+    let moColIndex: number = tabHeader.indexOf("Assembly");
+    let tabRowLength: number = lineData.length;
+
+
+    for (let row = 1; row < tabRowLength; row++) {
+
+      let enteredMOByRow: string = String(lineData[row][moColIndex]);
+
+      if (enteredMOByRow.match(moRegex)) {
+
+      } else {
+
+        errorHandleDictPushing("Assembly Value Error", "Assembly", Number(row) + 1, errorsDictToReturn, tabName);
+      }
+    }
+
+    return errorsDictToReturn
+  }
+
+
+  /** Function checks for a date value being both present and greater than the January 1st 2010 Excel S/N integer. */
+  function validateForDate(tabName: string, lineData: [[]], errorRowData: {}) {
+
+    const dateColNameRegex = /(Seed Date)|(Nursery Transplant)|(Finishing Transplant)|(Transplant Date)|(Harvest Date)/ig;
+    let errorsDictToReturn = errorRowData;
+    let tabRowLength: number = lineData.length;
+    let tabHeader: [] = [];
+
+    lineData[0].forEach((colName: string) => {
+
+      if (colName.match(dateColNameRegex)) {
+
+        let colIndex: number = lineData[0].indexOf(colName);
+
+        return tabHeader.push(colIndex)
+      }
+    });
+
+
+    tabHeader = tabHeader.sort((a,b)=>a-b);
+
+    for (let index of tabHeader) {
+
+      var errantDataArr: [] = lineData.map((element) => 42736 <= element[index]);
+
+      for (let row = 1; row < tabRowLength; row++) {
+
+        // If a date is not present in any date column && that date is not greater than 40179 (i.e. January 1st, 2010)
+        if (!errantDataArr[row]) {
+
+          let enteredDateValue: number | string | boolean = lineData[row][index];
+          enteredDateValue = enteredDateValue === "" ? true : false
+
+          if (enteredDateValue) {
+            // Value is an empty range...which is ok.
+          } else {
+
+            errorHandleDictPushing("Date Value Or Type Error", lineData[0][index], Number(row) + 1, errorsDictToReturn, tabName);
+          }
+        }
+      }
+    }
+
+    return errorsDictToReturn
+  }
+
+
+  /** Function checks the line number in the column Line versus the number entered in the activated tabs name.*/
+  function validateForLine(tabName: string, lineData: [[]], errorRowData: {}) {
+
+    // Correct Line value is taken from the line number indicated in the tab name.
+    const tabNumberRegexVal: number = Number(tabName.match(/\d+/g)[0]);
+
+    let errorsDictToReturn = errorRowData;
+    let tabHeader: [] = lineData[0];
+    let lineColIndex: number = tabHeader.indexOf("Line");
+    let tabRowLength: number = lineData.length;
+
+    for (let row = 1; row < tabRowLength; row++) {
+
+      let enteredLineDigit: number = lineData[row][lineColIndex];
+
+      if (enteredLineDigit === tabNumberRegexVal) {
+
+      } else {
+
+        errorHandleDictPushing("Line Number Error", "Line", Number(row) + 1, errorsDictToReturn, tabName);
+      }
+    }
+
+    return errorsDictToReturn
+  }
+
+
+  /** Function ensures that the critical DOL, DTT and DTH columns do have numbers in the ranges and that those numbers are above an anecdotal minimum value.*/
+  function validateForDays(tabName: string, lineData: [[]], errorRowData: {}) {
+
+    // Regular expression to find any of the following column names.
+    const daysToRegex = /(DOL)|(DTT)|(DTH)/ig;
+
+    let errorsDictToReturn = errorRowData;
+    let tabHeaderIndexes: [] = [];
+
+    lineData[0].forEach((colName: string) => {
+
+      if (colName.match(daysToRegex)) {
+
+        let colIndex: number = lineData[0].indexOf(colName);
+
+        return tabHeaderIndexes.push(colIndex)
+      }
+    });
+
+    let tabRowLength: number = lineData.length;
+
+    for (let index of tabHeaderIndexes) {
+
+      // let comparisonValue: number = lineData[0][index] === "DTH" ? 25 : 9; // original
+      let comparisonValue: number = 0;
+
+      for (let row = 1; row < tabRowLength; row++) {
+
+        let enteredDaysToValue: number = lineData[row][index];
+
+        // If the day on or to is greater than an approximate minimum number.
+        if (comparisonValue <= enteredDaysToValue) {
+          //...The value needs to be greater than 0.
+        } else {
+
+          errorHandleDictPushing("DTT|DOL|DTH too Low", lineData[0][index], Number(row) + 1, errorsDictToReturn, tabName);
+        }
+      }
+    }
+
+    return errorsDictToReturn
+  }
+
+
+  /** Function ensures that the initial Group metrics [tray count, gutter count, plant sites to sow] are present in the unfiltered data rows. */
+  function validateForGroup(tabName: string, lineData: [[]], errorRowData: {}) {
+
+    // Regular expression to find any of the following column names.
+    const groupMetricToRegex = /(Groups Size \(Trays\))|(Group Size \(Gutters\))|(PS Sown)/ig;
+
+    let errorsDictToReturn = errorRowData;
+    let tabHeaderIndexes: [] = [];
+
+    lineData[0].forEach((colName: string) => {
+
+      if (colName.match(groupMetricToRegex)) {
+
+        let colIndex: number = lineData[0].indexOf(colName);
+
+        return tabHeaderIndexes.push(colIndex)
+      }
+    });
+
+    let tabRowLength: number = lineData.length;
+
+    for (let index of tabHeaderIndexes) {
+
+      for (let row = 1; row < tabRowLength; row++) {
+
+        let enteredCntToValue: number|string = lineData[row][index];
+
+        // If the requested tray, gutter, etc cnt is a number and not blank (i.e. "").
+        if (typeof(enteredCntToValue) !== "string") {
+
+        } else {
+
+          errorHandleDictPushing("Group Metrics Missing", lineData[0][index], Number(row) + 1, errorsDictToReturn, tabName);
+        }
+      }
+    }
+
+    return errorsDictToReturn
+  }
+
+
+  /** Does every seed date have at least as many trays leaving (or more) as are being transplanted. */
+  function validateForSeedAndTransEquality(tabName: string, lineData: [[]], errorRowData: {}) {
+    
+    let errorsDictToReturn = errorRowData;
+    let seedDateIndex: number = lineData[0].indexOf("Seed Date");
+    let transDateIndex: number = lineData[0].indexOf("Transplant Date");
+    let trayIndex: number = lineData[0].indexOf("Group Size (Trays)");
+
+    let allSeedDates = lineData.slice(1,).map(row => row[seedDateIndex]);
+    let allTransDates = lineData.slice(1).map(row => row[transDateIndex]);
+    // const uniqueDates = Array.from(new Set(allTransDates.concat(allSeedDates)));
+    const uniqueDates = allSeedDates.filter(x => allTransDates.includes(x))
+
+    for (let date of uniqueDates) {
+
+      let lineDataSeedTrays = lineData.filter(row => row[seedDateIndex] == date).map(value => value[trayIndex]);
+      let lineDataTransTrays = lineData.filter(row => row[transDateIndex] == date).map(value => value[trayIndex]);
+      let seedTrayTotal = lineDataSeedTrays.reduce((accumulator, currentValue) => accumulator + currentValue, 0);
+      let transTrayTotal = lineDataTransTrays.reduce((accumulator, currentValue) => accumulator + currentValue, 0);
+
+      if (seedTrayTotal > transTrayTotal) {
+
+        let row: number = lineData.indexOf(lineData.filter(x => x[seedDateIndex] == date)[0]);
+        errorHandleDictPushing("Incoming Trays Greater Than Outgoing", "Seed Date", Number(row) + 1, errorsDictToReturn, tabName);
+      }
+
+    }
+    
+
+    return errorsDictToReturn
+  }
+
+  function validateForTrayVsGutterCount(){}
+
+
+  /** Function accepts the final errors dict and inserts the information into a separate, non-activated worksheet.*/
+  function csErrorsTab(errorsDictToReturn: {}) {
+
+    let allTabs = workbook.getWorksheets();
+    let tabNames = allTabs.map(element => { return element.getName() });
+
+    // Only add in an error worksheet if it doesn't already exist.
+    if (!tabNames.includes("CurrentErrors")) {
+
+      workbook.addWorksheet("CurrentErrors");
+    }
+
+    const errorWS = workbook.getWorksheet("CurrentErrors");
+
+    try {
+      errorWS.activate();
+      errorWS.getUsedRange(true).clear(ExcelScript.ClearApplyTo.all);
+    }
+    catch (TypeError) {
+
+    }
+
+    var lastRowCounter: number = 1;
+    var titleIndexesArray: number[] = [0]; // Holds the positions of the bolded "titles" for lines in error report.
+    var finalErrorDataArray: [] = [];
+    var errorDictToKVArray = Object.entries(errorsDictToReturn);
+
+    let key: string;
+    let values: [];
+
+    errorWS.getRangeByIndexes(0, 0, 1, 3).setValues([["Line|Error Type", "Column Name", "Row Number"]]);
+
+
+    // Insert the values from every key:[] that was found.
+    for ([key, values] of errorDictToKVArray) {
+
+      values.splice(0, 0, [key, "", ""]);
+      let lineErrorDataLength = values.length;
+
+      values.forEach(element => finalErrorDataArray.push(element))
+
+      titleIndexesArray.push(lastRowCounter);
+      lastRowCounter += lineErrorDataLength;
+    }
+
+    if (errorDictToKVArray.length > 0) {
+
+      errorWS.getRangeByIndexes(1, 0, finalErrorDataArray.length, 3).setValues(finalErrorDataArray);
+    } else {
+
+      errorWS.getRangeByIndexes(lastRowCounter, 0, 1, 1).setValue("No Errors Found");
+    }
+
+    // Add in formatting to the title lines as recorded from the loop above.
+    for (let i in titleIndexesArray) {
+
+      let titleRow = errorWS.getRangeByIndexes(titleIndexesArray[i], 0, 1, 3).getFormat();
+      let fontSize = titleIndexesArray[i] !== 0 ? 13 : 16;
+
+      titleRow.getFont().setSize(fontSize);
+      titleRow.getFont().setBold(true);
+    }
+
+    errorWS.getUsedRange(true).getFormat().autofitColumns();
+
+    return
+  }
+
+
+  /** Function iterates through the tab data [logged as a key:values relationship] and applies the validation functions to seek out and collate errant data.*/
+  function validateActivatedLineData(fullData: {}) {
+
+    const validationsPage = workbook.getWorksheet("WORKBOOK_VALIDATIONS").getUsedRange(true);
+    const validationsPageValues = validationsPage.getValues();
+    const headers = validationsPageValues[0];
+    const acceptedSkusIndex = headers.indexOf("ACCEPTED SKUS");
+    const skus: [] = validationsPageValues.map(element => element[acceptedSkusIndex]).filter(sku => sku !== "");
+
+    const siteNameRegex = /\S{3}\s?(?=\d)|([A-Z]{3})/g;
+    const fileName = workbook.getName().toString();
+    const siteName = fileName.match(siteNameRegex)[0];
+
+    var errorsDictToReturn: {} = {};
+      errorsDictToReturn = validateFileNameFormat(errorsDictToReturn);
+
+    for (const [key, values] of Object.entries(fullData)) {
+
+      errorsDictToReturn = validateTabNames(key, errorsDictToReturn)
+      errorsDictToReturn = validateColumnNames(key, values, errorsDictToReturn, siteName);
+      errorsDictToReturn = validateForSKU(key, values, errorsDictToReturn, skus);
+      errorsDictToReturn = validateForAssembly(key, values, errorsDictToReturn);
+      errorsDictToReturn = validateForDate(key, values, errorsDictToReturn);
+      errorsDictToReturn = validateForLine(key, values, errorsDictToReturn);
+      errorsDictToReturn = validateForDays(key, values, errorsDictToReturn);
+      errorsDictToReturn = validateForGroup(key, values, errorsDictToReturn);
+      // errorsDictToReturn = validateForSeedAndTransEquality(key, values, errorsDictToReturn);
+    }
+
+    return errorsDictToReturn
+  }
+
+
+  const fullData: {} = grabDataFromEveryTab();
+
+  const errorData = validateActivatedLineData(fullData);
+
+  return csErrorsTab(errorData);
+}
