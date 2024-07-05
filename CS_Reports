@@ -1,0 +1,362 @@
+
+function main(workbook: ExcelScript.Workbook) {
+  // blank dates show up in the report even if they are not the correct date... e.g. 8/25 germ chamber removal
+  // needs to fill in missing date values even though the code handles them. and also reset the excel type when all is done
+
+  const activeWS = workbook.getActiveWorksheet();
+
+    /** Returns a dictionary with tab names as keys and values as row data array. */
+    function grabDataFromEveryTab() {
+        
+        
+        let allTabs = workbook.getWorksheets();
+        let tabNames = allTabs.map(element => {return element.getName()});
+        let caratTabNames = tabNames.filter(element => {return element.match(/^\^/)});
+        
+        var allData = {};
+
+        let allCSData = caratTabNames.forEach(tabName => {
+          
+            allData[tabName] = workbook.getWorksheet(tabName).getUsedRange(true).getValues();            
+        });
+
+        return allData
+    }
+
+
+    /** Function takes the user-entered date values as arguments which are read as excel date serial numbers. The start date must always be less than or equal to the end date. If this is not the case, the end date is set as the start date in the UI and in the script. */
+    function validateStartEndDates(startDate: number, endDate: number) {
+
+      var verifiedStartDate = 0;
+      var verifiedEndDate = 0;
+
+      if ((startDate + endDate) !== 0) {
+
+        let sn_sorted = [startDate, endDate].sort((a,b) => a-b);
+        verifiedStartDate = sn_sorted[0] > 0 ? sn_sorted[0] : sn_sorted[1];
+        verifiedEndDate = sn_sorted[1] > 0 ? sn_sorted[1] : sn_sorted[0];
+
+        if (startDate > endDate) {
+
+          activeWS.getRange("A2").setValue(verifiedStartDate);
+          activeWS.getRange("A5").setValue(verifiedEndDate);
+        } else if (startDate === 0) {
+          
+          activeWS.getRange("A2").setValue(verifiedEndDate);
+          activeWS.getRange("A5").setValue(verifiedEndDate);
+        }
+      } else {
+
+        let today = "=TODAY()";
+        activeWS.getRange("A2").setValue(today);
+        activeWS.getRange("A5").setValue(today);
+      }
+
+      return [verifiedStartDate, verifiedEndDate]
+    }
+
+
+    /** Funtion returns whatever date that user has entered. */
+    function excelDateSNRetrieve() {
+
+      let enteredStartDate = Number(activeWS.getRange("A2").getValue());
+      let enteredEndDate = Number(activeWS.getRange("A5").getValue());
+      [enteredStartDate, enteredEndDate] = validateStartEndDates(enteredStartDate, enteredEndDate);
+
+      // arrayWithSpaces returns the equivalent of python's range func. e.g. StartDate = 1000 EndDate = 1010 => [0,1,2,3,4,5,6,7,8,9]; The expression is up to date for EC6
+      let arrayWithSpaces = Array.from(Array(enteredEndDate - (enteredStartDate - 1)).keys());
+      let excelSNDateArr = arrayWithSpaces.map(element => element + enteredStartDate);
+
+      return excelSNDateArr
+    }
+
+
+  /** Function filters all data rows that have user indicated date range in the columns. */
+  function filterDataForSelectedDay(dfDict: {}, dateSNArr: number[], activityLayoutDict: {}) {
+
+      let dfKey: Array<string> = Object.keys(dfDict);
+      let toReturnDict = {};
+      let selectedAction: string = activeWS.getRange("A8").getValue().toString(); 
+ 
+      // {key = line#, value = [row arrays]}
+      for (const [key, value] of Object.entries(dfDict)) {
+        
+        // Header column added pre-filtering for correct indexing in subsequent function.
+        toReturnDict[key] = [value[0]];
+
+        let actionIndex: Number = value[0].indexOf(activityLayoutDict[`${selectedAction}`]["colName"]);
+
+        // If Whatever is entered for the activity does not have a specific date to filter off of, then us the harvest date.
+        actionIndex = actionIndex == -1 ? value[0].indexOf("Harvest Date")  : actionIndex;
+
+        for (let row of value) {
+
+          for (let date of dateSNArr) {
+            row[actionIndex] == date ? toReturnDict[key].push(row) : false;
+            
+          }
+        }
+      }
+      
+      return toReturnDict
+    }
+
+
+  /**Function filters the data for rows that have greater than 0 ps planted. */
+  function filterDataForZeroPSPlantedValue(dfDict: {}){
+    let psPlantedRule = 0;
+    let toReturnDict = {};
+
+    // {key = line#, value = [row arrays]}
+    for (const [key, value] of Object.entries(dfDict)) {
+
+      // Header column added pre-filtering for correct indexing in subsequent function.
+      toReturnDict[key] = [value[0]];
+
+      let psIndex: Number = value[0].indexOf("PS Planted");
+
+      for (let i = 1; i < key.length; i++) {
+        
+        try {
+          value[i][psIndex] > psPlantedRule ? toReturnDict[key].push(value[i]) : false;
+        } catch {
+          continue;
+        }
+      }
+    }
+
+    return toReturnDict
+  }
+      
+
+  /** Function returns a dictionary. Rows having the specified date values will be pushed to the appropriate activity key. All activities are searched. */
+  function parcelDataByActivity(verifiedSNRows: {}, dateSNArr: [number], columnToLineMap: {}) {
+
+    const lineNumberRegex = /\d+/gm;
+    const tabToReportMap = mapToStdReportColOrder(columnToLineMap);
+
+    var acceptedActivitiesDict = {"Seed Date": [], "Transplant Date": [], "Nursery Transplant": [],
+      "Move Out Of Chamber Date": [], "Finishing Transplant": [], "Harvest Date": [], "CUSTOM": []};
+    
+
+    for (const [key, values] of Object.entries(verifiedSNRows)) {
+
+      let lineNameInteger = Number(key.match(lineNumberRegex)[0]);
+
+      for (let row of values) {
+
+        for (let date of dateSNArr) {          
+          
+          // Find which column any of the dates between start and end date of the report exists in every filtered row.
+          let sn_index: number = row.indexOf(date);
+          let sn_found = sn_index !== -1 ? true : false;
+  
+          if (sn_found) {
+            
+            let mappedRow = rowDataMappedForReport(row, tabToReportMap, lineNameInteger);
+            
+            try{
+
+              acceptedActivitiesDict[values[0][sn_index]].push(mappedRow);
+            } catch(TypeError) {
+              
+              activeWS.getRange("C7").setValue(`The script is not able to fully read all tabs. A misnamed date column has been found in tab ${key}. Please correct and run the report again.`);        
+            }
+          }
+        }
+      }
+    }
+
+    return acceptedActivitiesDict
+  }
+
+
+  /** Grab all of the current headers (values), by tab (key), and preserve order. */
+  function lineByColHeaderOrder_(allActivatedData: {}) {
+
+    const lineNumberRegex = /\d+/gm;
+    var tabNameHeaderNameOrder = {};
+
+    for (const [key, values] of Object.entries(allActivatedData)) {
+
+      let lineKeyName: number = Number(key.match(lineNumberRegex)[0]);
+      tabNameHeaderNameOrder[lineKeyName] = values[0];//.filter(element => element !== "");//temp off to address unlabeled columns within the cropschedule dataframe
+      // tabNameHeaderNameOrder[lineKeyName] = tabNameHeaderNameOrder[lineKeyName].map((element) => element.trim());
+
+    }
+
+    return tabNameHeaderNameOrder
+  }
+
+
+  /** Function returns a map for each tab's header row column names' locations to the report's header row column names' locations. */
+  function mapToStdReportColOrder(tabColsOrderUnmodified:{}) {
+    
+    let reportWSLastCol: number = activeWS.getUsedRange(true).getLastColumn().getColumnIndex();
+    let reportHeaders = activeWS.getRangeByIndexes(7, 2, 1, reportWSLastCol-1).getValues()[0];
+
+    let actualColToReportColDict = {};
+    
+    for (const [key, values] of Object.entries(tabColsOrderUnmodified)) {
+
+      actualColToReportColDict[key] = {};
+      
+      for (let i in values) {
+
+        if (reportHeaders.includes(values[i])) {
+
+          actualColToReportColDict[key][i] = reportHeaders.indexOf(values[i]);
+        } else {}
+      }
+      
+      actualColToReportColDict[key];
+    }
+
+    return actualColToReportColDict
+  }
+
+
+  /** Function accepts a known tab column name map to the selected/identical column names in the report. The return value is an array created by assignment of specific string or number values to an indexed position. If no value is mapped (e.g. the value is not a std column or is intended to be "") then a blank (or undefined) value will be held in-place for spacing.*/
+  function rowDataMappedForReport(rows: [], columnMapping: {}, lineIndex: number) {
+
+    let updatedRow: (number|string)[] = [];
+    let reportDefinedNewColMapping: number = columnMapping[lineIndex];
+
+    for (let i in rows) {
+
+      let newPosition: number = reportDefinedNewColMapping[i];
+
+      if (newPosition !== undefined) {
+        
+        updatedRow[newPosition] = excelSNtoDateFormat(rows[i]);
+      }
+    }
+
+    return updatedRow
+  }
+
+
+  /** Function accepts of the values the user intends to be entered into their report. The value is checked whether of not it exceeds an extreme integer value which is only beaten by an Excel date s/n. If it is such a number, that value is converted into human readable short date. If not, the value is passed back. */
+  function excelSNtoDateFormat(value: (string|number)) {
+
+    let checked_value: string | number | Date;
+
+    // Excel SN Date 40,000 == July 6th, 2009
+    if (value > 40000) {
+
+      let excelDatefor0101770: number = 25569;
+      let millisPerDay: number = 86400000;
+      let conversionMath = (Number(value) - excelDatefor0101770) * millisPerDay;
+      let utcDATE = new Date(conversionMath);
+
+      checked_value = `${utcDATE.getUTCMonth() + 1}/${utcDATE.getUTCDate()}/${utcDATE.getUTCFullYear()}`;
+
+    } else {
+
+      checked_value = value;
+    }
+
+    return checked_value
+  }
+
+
+  /** The function procedure inserts data and adjusts the data area's formatting. */
+  function insertDataByActivity (dataToInsert:{}, activityLayoutDict: {}) {
+
+    let activeWSLR: number = activeWS.getUsedRange(false).getLastRow().getRowIndex();
+    
+    let selectedActivity = activeWS.getRange("A8").getValue();
+
+    var activityData: [] = dataToInsert[activityLayoutDict[`${selectedActivity}`].colName];
+    var dfHeight: number = activityData.length;
+    
+    var previousReportArea = activeWS.getRangeByIndexes(8, 2, activeWSLR, 10);
+    previousReportArea.clear();
+
+    var newVisualFrame: ExcelScript.Range;
+
+    if (dfHeight > 0) {
+
+      // Set Data
+      let dfWidth: number = activityData[0].length;
+      let newReportDataFrame = activeWS.getRangeByIndexes(8, 2, dfHeight, dfWidth);
+        newReportDataFrame.setValues(activityData);
+
+      // Add Formatting
+      newVisualFrame = activeWS.getRangeByIndexes(8, 2, dfHeight, 10);
+      let areaFormat = newVisualFrame.getFormat();
+      let areaFontFormat = areaFormat.getFont();
+      let areaFillFormat = areaFormat.getFill();
+      areaFillFormat.setColor("cee0d4"); // BTHD Green == "37A157"
+      areaFontFormat.setSize(13);
+      areaFormat.setHorizontalAlignment('center');
+      areaFormat.autofitColumns();
+
+    } else {
+
+      let notice = "The search returned no data. Please check that the date entered is actually present in at least 1 ^Line tab. For columns where you want data pulled from tabs, Please use the data validation dropdown menus to select valid column names. No specific column order is required."
+      activeWS.getRangeByIndexes(8, 2, 1, 1).setValue(notice);
+      activeWS.getRangeByIndexes(8, 2, 1, 1).getFormat().setHorizontalAlignment("left");
+    }
+    
+    return newVisualFrame.getImage();
+  }
+
+
+  /** */
+  function grabColumnHeadersForReport() {
+
+    const validationsWS = workbook.getWorksheet("WORKBOOK_VALIDATIONS");
+    
+
+    let reportOfInterest = activeWS.getRange("A8").getValue().toString();
+
+    let referenceWSFrame = validationsWS.getUsedRange();
+    let lastColIndex = referenceWSFrame.getLastColumn().getColumnIndex();
+    let lastRowIndex = referenceWSFrame.getLastRow().getRowIndex();
+    let headers = validationsWS.getRangeByIndexes(0, 0, 1, lastColIndex + 1).getValues()[0];
+
+    let reportColsIndex: number = headers.indexOf(reportOfInterest);
+
+    let reportColumns = validationsWS.getRangeByIndexes(1, reportColsIndex, lastRowIndex + 1, 1).getValues().filter(element => element[0] !== "");
+    
+    let arrayToEnter = [reportColumns.map(element => element[0])];
+
+    activeWS.getRangeByIndexes(7, 2, 1, 10).clear(ExcelScript.ClearApplyTo.contents);
+    activeWS.getRangeByIndexes(7, 2, 1, arrayToEnter[0].length).setValues(arrayToEnter);
+
+    return arrayToEnter
+  }
+
+
+  const reportColInfo = grabColumnHeadersForReport();
+  const dateTypeOfInterest = reportColInfo[0].findIndex(element => element.toString().match(/Date/));
+
+  const activityToColumnNameMap = {
+    "SEED": { "colName": "Seed Date", "colHeaderRange": [1, 4, 10, 1] },
+    "NURSERY TRANS": { "colName": "Nursery Transplant", "colHeaderRange": [1, 6, 10, 1] },
+    "Move Out Of Chamber Date": { "colName": "Move Out Of Chamber Date", "colHeaderRange": [1, 8, 10, 1] },
+    "FINISHING TRANS": { "colName": "Finishing Transplant", "colHeaderRange": [1, 10, 10, 1] },
+    "TRANSPLANT": { "colName": "Transplant Date", "colHeaderRange": [1, 12, 10, 1] },
+    "HARVEST": { "colName": "Harvest Date", "colHeaderRange": [1, 14, 10, 1] },
+    "CUSTOM": { "colName": "Harvest Date", "colHeaderRange": [1, 16, 10, 1] }, 
+  };
+
+
+  const allData = grabDataFromEveryTab();
+  const allTabColNamesAndOrder = lineByColHeaderOrder_(allData);
+
+  const selectedDay = excelDateSNRetrieve();
+  const allRowsWithCorrectSNDate: {} = filterDataForSelectedDay(allData, selectedDay, activityToColumnNameMap);
+  // const allRowsWithPsPlanted: {} = filterDataForZeroPSPlantedValue(allRowsWithCorrectSNDate);
+  const allRowsRearrangedByActivity: {} = parcelDataByActivity(allRowsWithCorrectSNDate, selectedDay, allTabColNamesAndOrder);
+
+
+  if (allRowsRearrangedByActivity) {
+
+    return insertDataByActivity(allRowsRearrangedByActivity, activityToColumnNameMap)
+  } else {
+
+    return
+  }
+}
